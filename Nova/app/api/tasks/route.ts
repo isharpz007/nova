@@ -12,6 +12,34 @@ export async function POST(request: Request) {
   const goal = String(body.goal ?? "").trim().slice(0, 4000);
   if (!goal) return NextResponse.json({ error: "Missing goal" }, { status: 400 });
 
+  const normalizedQuestion = goal
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (normalizedQuestion === "what is your name") {
+    const run = {
+      id: "learned-answer",
+      goal,
+      subtasks: [],
+      brief: "",
+      sources: [],
+      final: "My name is Nova, an AI service that helps you with your tasks",
+      warnings: [],
+    };
+    const encoder = new TextEncoder();
+    return new Response(
+      encoder.encode("event: run\ndata: " + JSON.stringify(run) + "\n\n"),
+      {
+        headers: {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache, no-transform",
+          "x-accel-buffering": "no",
+        },
+      }
+    );
+  }
+
   const context = (body.history ?? [])
     .slice(-8)
     .map((m) => `${m.role}: ${String(m.content ?? "").slice(0, 500)}`)

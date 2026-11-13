@@ -21,14 +21,14 @@ export interface ProviderResult {
   truncated?: boolean;
 }
 
-type ProviderCall = (messages: ChatMessage[], model: string) => Promise<ProviderResult>;
+type ProviderCall = (messages: ChatMessage[], model: string, maxTokens?: number) => Promise<ProviderResult>;
 
 const API_TIMEOUT = 90_000;
 const MAX_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS ?? 8192);
 
 // ---------- provider implementations ----------
 
-async function openai(messages: ChatMessage[], model: string): Promise<ProviderResult> {
+async function openai(messages: ChatMessage[], model: string, maxTokens?: number): Promise<ProviderResult> {
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -38,7 +38,7 @@ async function openai(messages: ChatMessage[], model: string): Promise<ProviderR
     body: JSON.stringify({
       model,
       messages,
-      max_completion_tokens: MAX_TOKENS,
+      max_completion_tokens: maxTokens ?? MAX_TOKENS,
     }),
     signal: AbortSignal.timeout(API_TIMEOUT),
   });
@@ -58,7 +58,7 @@ async function openai(messages: ChatMessage[], model: string): Promise<ProviderR
   };
 }
 
-async function gemini(messages: ChatMessage[], model: string): Promise<ProviderResult> {
+async function gemini(messages: ChatMessage[], model: string, maxTokens?: number): Promise<ProviderResult> {
   const system = messages.find((m) => m.role === "system")?.content ?? "";
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -76,7 +76,7 @@ async function gemini(messages: ChatMessage[], model: string): Promise<ProviderR
             role: m.role === "assistant" ? "model" : "user",
             parts: [{ text: m.content }],
           })),
-        generationConfig: { maxOutputTokens: MAX_TOKENS },
+        generationConfig: { maxOutputTokens: maxTokens ?? MAX_TOKENS },
       }),
       signal: AbortSignal.timeout(API_TIMEOUT),
     }
@@ -98,7 +98,7 @@ async function gemini(messages: ChatMessage[], model: string): Promise<ProviderR
   };
 }
 
-async function groq(messages: ChatMessage[], model: string): Promise<ProviderResult> {
+async function groq(messages: ChatMessage[], model: string, maxTokens?: number): Promise<ProviderResult> {
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -108,7 +108,7 @@ async function groq(messages: ChatMessage[], model: string): Promise<ProviderRes
     body: JSON.stringify({
       model,
       messages,
-      max_tokens: MAX_TOKENS,
+      max_tokens: maxTokens ?? MAX_TOKENS,
     }),
     signal: AbortSignal.timeout(API_TIMEOUT),
   });
@@ -128,7 +128,7 @@ async function groq(messages: ChatMessage[], model: string): Promise<ProviderRes
   };
 }
 
-async function anthropic(messages: ChatMessage[], model: string): Promise<ProviderResult> {
+async function anthropic(messages: ChatMessage[], model: string, maxTokens?: number): Promise<ProviderResult> {
   const system = messages.find((m) => m.role === "system")?.content ?? "";
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -139,7 +139,7 @@ async function anthropic(messages: ChatMessage[], model: string): Promise<Provid
     },
     body: JSON.stringify({
       model,
-      max_tokens: MAX_TOKENS,
+      max_tokens: maxTokens ?? MAX_TOKENS,
       system,
       messages: messages.filter((m) => m.role !== "system"),
     }),
@@ -159,12 +159,12 @@ async function anthropic(messages: ChatMessage[], model: string): Promise<Provid
   };
 }
 
-async function ollama(messages: ChatMessage[], model: string): Promise<ProviderResult> {
+async function ollama(messages: ChatMessage[], model: string, maxTokens?: number): Promise<ProviderResult> {
   const base = (process.env.OLLAMA_URL ?? "http://localhost:11434").replace(/\/$/, "");
   const res = await fetch(`${base}/api/chat`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model, stream: false, keep_alive: "30m", messages }),
+    body: JSON.stringify({ model, stream: false, keep_alive: "30m", messages, options: { num_predict: maxTokens ?? MAX_TOKENS } }),
     signal: AbortSignal.timeout(180_000),
   });
   const data = await res.json().catch(() => null);
@@ -186,7 +186,7 @@ async function ollama(messages: ChatMessage[], model: string): Promise<ProviderR
  * (llama.cpp llama-server, vLLM, LocalAI, a custom training/inference server).
  * Configure with CUSTOM_LLM_URL, CUSTOM_LLM_MODEL and (optionally) CUSTOM_LLM_API_KEY.
  */
-async function customLlm(messages: ChatMessage[], model: string): Promise<ProviderResult> {
+async function customLlm(messages: ChatMessage[], model: string, maxTokens?: number): Promise<ProviderResult> {
   const base = (process.env.CUSTOM_LLM_URL ?? "http://localhost:8080").replace(/\/$/, "");
   const res = await fetch(`${base}/v1/chat/completions`, {
     method: "POST",
@@ -196,7 +196,7 @@ async function customLlm(messages: ChatMessage[], model: string): Promise<Provid
         ? { authorization: `Bearer ${process.env.CUSTOM_LLM_API_KEY}` }
         : {}),
     },
-    body: JSON.stringify({ model, messages, max_tokens: MAX_TOKENS }),
+    body: JSON.stringify({ model, messages, max_tokens: maxTokens ?? MAX_TOKENS }),
     signal: AbortSignal.timeout(120_000),
   });
   const data = await res.json().catch(() => null);
@@ -366,6 +366,29 @@ async function runChain(
     index++;
   }
   throw new Error(`All providers failed for ${label} — ${errors.join(" | ")}`);
+}
+
+/** Tiny liveness probe for one provider — used by the health endpoint. */
+export async function probeProvider(
+  provider: ProviderId,
+  messages: ChatMessage[],
+  maxTokens = 10
+): Promise<{ ok: boolean; model: string; ms: number; error?: string }> {
+  const p = PROVIDERS[provider];
+  const model = DEFAULT_MODEL[provider];
+  if (!p) return { ok: false, model, ms: 0, error: "unknown provider" };
+  const started = Date.now();
+  try {
+    await p.call(messages, model, maxTokens);
+    return { ok: true, model, ms: Date.now() - started };
+  } catch (err) {
+    return {
+      ok: false,
+      model,
+      ms: Date.now() - started,
+      error: err instanceof Error ? err.message : "failed",
+    };
+  }
 }
 
 /** Route a call to the model assigned to a specific agent, with fallback. */

@@ -140,8 +140,14 @@ export function fallbackResponse(input: AuthorInput): string {
   return injectFiles(deterministicReply(input), extractFiles(input.subtasks).files);
 }
 
+const GAP_LABEL: Record<string, string> = {
+  designer: "the design plan",
+  developer: "the code",
+  interviewer: "the requirements",
+  fast: "the quick answer",
+};
+
 function deterministicReply(input: AuthorInput): string {
-  const parts: string[] = [`Request: ${input.goal.trim()}`, ""];
   const done = input.subtasks.filter((s) => s.output?.trim());
   const gaps = input.subtasks.filter(
     (s) => s.status === "failed" || s.status === "failed_blocked" || (!s.output?.trim() && s.status !== "pending")
@@ -149,11 +155,42 @@ function deterministicReply(input: AuthorInput): string {
   // Strip internal status markers from raw outputs before they reach the user.
   const scrub = (t: string) =>
     t.replace(/\[(Devin|rescue|rescued|agent|subtask|fallback)[^\]\n]*\]/gi, "").trim();
-  for (const s of done) parts.push(scrub(s.output!), "");
+
+  const sources = input.sources ?? [];
+  let body = done.map((s) => scrub(s.output!)).join("\n\n");
+
+  if (sources.length) {
+    // Keep citations that resolve to a real source; list only the cited ones.
+    const cited = new Set<number>();
+    for (const m of body.matchAll(/\[(\d+)\]/g)) {
+      const n = parseInt(m[1], 10);
+      if (n >= 1 && n <= sources.length) cited.add(n);
+    }
+    if (cited.size) {
+      const list = [...cited]
+        .sort((a, b) => a - b)
+        .map((n) => `[${n}] ${sources[n - 1].title || sources[n - 1].url} — ${sources[n - 1].url}`)
+        .join("\n");
+      body += `\n\nSources:\n${list}`;
+    }
+  } else {
+    body = body.replace(/\s?\[\d+\]/g, "");
+  }
+
+  const parts: string[] = [];
+  if (!done.length) {
+    parts.push(
+      `I'm sorry — I couldn't answer "${input.goal.trim()}" right now. ` +
+        "This is usually temporary; please try again in a few minutes."
+    );
+  } else {
+    if (done.length > 1) parts.push(`Here is what I could put together for "${input.goal.trim()}":`, "");
+    parts.push(body);
+  }
   if (gaps.length) {
-    parts.push("Not finished:");
-    for (const s of gaps) parts.push(`- ${s.instruction} — could not be completed.`);
-    parts.push("");
+    parts.push("", "I could not finish these parts:");
+    for (const s of gaps) parts.push(`- ${GAP_LABEL[s.agent] ?? "the work"}`);
+    parts.push("", "Ask me to try again and I'll take another pass at them.");
   }
   return parts.join("\n").trim() || "I wasn't able to produce a reply. Please try again.";
 }

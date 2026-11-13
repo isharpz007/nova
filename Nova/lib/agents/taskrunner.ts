@@ -34,7 +34,7 @@ export interface TaskRun {
 }
 
 export type TaskEvent =
-  | { type: "plan"; subtasks: Subtask[] }
+  | { type: "plan"; subtasks: Subtask[]; warnings: string[] }
   | { type: "subtask_started"; id: string }
   | { type: "subtask_done"; id: string }
   | { type: "subtask_rescued"; id: string; reason: string }
@@ -56,51 +56,79 @@ const withTimeout = <T>(p: Promise<T>, ms: number, what: string): Promise<T> =>
   ]);
 
 interface RawPlan {
-  subtasks?: Array<{ id?: string; agent?: string; instruction?: string; dependsOn?: string[] }>;
+  subtasks?: Array<{ id?: string; agent?: string; instruction?: string; dependsOn?: string[] | string }>;
 }
 
-/** Validate plan: <=6 subtasks, valid agents, deps exist, no cycles. */
-function validatePlan(plan: RawPlan, goal: string): Subtask[] | null {
-  const raw = (plan.subtasks ?? []).slice(0, MAX_SUBTASKS);
-  if (!raw.length) return null;
+interface PlanCheck {
+  subs: Subtask[] | null;
+  /** Why validation failed — fed back to the planner on retry. */
+  reason: string;
+}
 
-  const subs: Subtask[] = [];
-  const ids = new Set<string>();
-  for (const [i, s] of raw.entries()) {
-    const id = s.id?.trim() || `S${i + 1}`;
-    const agent = (s.agent ?? "developer") as AgentId;
-    if (ids.has(id) || !AGENT_IDS.includes(agent)) return null;
-    ids.add(id);
-    subs.push({
-      id,
-      agent,
-      instruction: String(s.instruction ?? "").trim() || goal,
-      dependsOn: (s.dependsOn ?? []).filter((d) => typeof d === "string"),
-      status: "pending",
-    });
-  }
-  for (const s of subs) {
-    s.dependsOn = s.dependsOn.filter((d) => ids.has(d) && d !== s.id);
-  }
+/** Validate plan: <=6 subtasks, valid agents, deps exist, no cycles. Normalizes first. */
+function validatePlan(plan: RawPlan, goal: string): PlanCheck {
+  try {
+    const raw = (plan.subtasks ?? []).slice(0, MAX_SUBTASKS);
+    if (!raw.length) return { subs: null, reason: "empty subtask list" };
 
-  // Cycle check (DFS)
-  const byId = new Map(subs.map((s) => [s.id, s]));
-  const state = new Map<string, number>(); // 0=unvisited 1=visiting 2=done
-  const visit = (id: string): boolean => {
-    const st = state.get(id) ?? 0;
-    if (st === 1) return false; // cycle
-    if (st === 2) return true;
-    state.set(id, 1);
-    for (const d of byId.get(id)?.dependsOn ?? []) if (!visit(d)) return false;
-    state.set(id, 2);
-    return true;
-  };
-  for (const s of subs) if (!visit(s.id)) return null;
-  return subs;
+    const subs: Subtask[] = [];
+    const ids = new Set<string>();
+    for (const [i, s] of raw.entries()) {
+      const id = s.id?.trim() || `S${i + 1}`;
+      const agent = String(s.agent ?? "developer")
+        .trim()
+        .toLowerCase()
+        .replace(/\s*agent$/, "") as AgentId;
+      const dependsOn = Array.isArray(s.dependsOn)
+        ? s.dependsOn
+        : typeof s.dependsOn === "string"
+          ? [s.dependsOn]
+          : [];
+      if (ids.has(id)) return { subs: null, reason: `duplicate subtask id '${id}'` };
+      if (!AGENT_IDS.includes(agent)) return { subs: null, reason: `unknown agent '${s.agent}'` };
+      ids.add(id);
+      subs.push({
+        id,
+        agent,
+        instruction: String(s.instruction ?? "").trim() || goal,
+        dependsOn: dependsOn.filter((d) => typeof d === "string"),
+        status: "pending",
+      });
+    }
+    for (const s of subs) {
+      s.dependsOn = s.dependsOn.filter((d) => ids.has(d) && d !== s.id);
+    }
+
+    // Cycle check (DFS)
+    const byId = new Map(subs.map((s) => [s.id, s]));
+    const state = new Map<string, number>(); // 0=unvisited 1=visiting 2=done
+    const visit = (id: string): boolean => {
+      const st = state.get(id) ?? 0;
+      if (st === 1) return false; // cycle
+      if (st === 2) return true;
+      state.set(id, 1);
+      for (const d of byId.get(id)?.dependsOn ?? []) if (!visit(d)) return false;
+      state.set(id, 2);
+      return true;
+    };
+    for (const s of subs) {
+      if (!visit(s.id)) return { subs: null, reason: `dependency cycle at '${s.id}'` };
+    }
+    return { subs, reason: "" };
+  } catch (e) {
+    return { subs: null, reason: e instanceof Error ? e.message : "plan validation error" };
+  }
 }
 
 const fallbackPlan = (goal: string): Subtask[] => [
-  { id: "S1", agent: "developer", instruction: goal, dependsOn: [], status: "pending" },
+  {
+    id: "S1",
+    agent: "designer",
+    instruction: `Produce a plan and spec for: ${goal}`,
+    dependsOn: [],
+    status: "pending",
+  },
+  { id: "S2", agent: "developer", instruction: goal, dependsOn: ["S1"], status: "pending" },
 ];
 
 // A subtask "waiting" for the user is a stall — there is no user round-trip.
@@ -215,7 +243,9 @@ export async function runTask(
   // 1. Plan + research in parallel.
   const [planResult, researchResult] = await Promise.all([
     callJson<RawPlan>("lead", LEAD_PLAN_PROMPT(goal, contextBlock)).catch((e) => {
-      run.warnings.push(`Planning failed: ${e instanceof Error ? e.message.slice(0, 120) : "error"}`);
+      const msg = `Planning failed: ${e instanceof Error ? e.message.slice(0, 120) : "error"}`;
+      console.warn(`[planner] ${msg}`);
+      run.warnings.push(msg);
       return null;
     }),
     gatherSources(goal, { agent: "fast", maxResults: 8, maxPages: 4 }).catch(() => ({
@@ -227,10 +257,41 @@ export async function runTask(
   run.brief = buildBrief(researchResult.sources);
   run.warnings.push(...researchResult.warnings);
 
-  const plan = planResult ? validatePlan(planResult, goal) : null;
+  let plan: Subtask[] | null = null;
+  if (planResult) {
+    let check = validatePlan(planResult, goal);
+    if (!check.subs) {
+      console.warn(`[planner] plan rejected (${check.reason}) — retrying once`);
+      const retry = await callJson<RawPlan>("lead", [
+        ...LEAD_PLAN_PROMPT(goal, contextBlock),
+        { role: "assistant" as const, content: JSON.stringify(planResult).slice(0, 3000) },
+        {
+          role: "user" as const,
+          content: `That plan was invalid: ${check.reason}. Fix it and reply with a single JSON object only.`,
+        },
+      ]).catch((e) => {
+        console.warn(`[planner] retry call failed: ${e instanceof Error ? e.message.slice(0, 120) : "error"}`);
+        return null;
+      });
+      if (retry) {
+        check = validatePlan(retry, goal);
+        if (!check.subs) {
+          console.warn(`[planner] retry plan rejected (${check.reason})`);
+          run.warnings.push(`Plan invalid after retry: ${check.reason}`);
+        }
+      } else {
+        run.warnings.push(`Plan invalid (${check.reason}); planner retry unavailable`);
+      }
+    }
+    plan = check.subs;
+  }
+
   run.subtasks = plan ?? fallbackPlan(goal);
-  if (!plan) run.warnings.push("Used fallback single-developer plan");
-  onEvent({ type: "plan", subtasks: run.subtasks });
+  if (!plan) {
+    console.warn("[planner] using fallback designer->developer plan");
+    run.warnings.push("Planning used a fallback plan (designer -> developer)");
+  }
+  onEvent({ type: "plan", subtasks: run.subtasks, warnings: [...run.warnings] });
 
   // 2. Execute in dependency order, independent subtasks in parallel (cap 3).
   const byId = new Map(run.subtasks.map((s) => [s.id, s]));

@@ -107,6 +107,27 @@ export async function POST(request: Request) {
 
   const userRequest = messages[messages.length - 1].content;
   const history = messages.slice(0, -1);
+  const normalizedQuestion = userRequest
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const savedAnswer = normalizedQuestion === "what is your name"
+    ? "My name is Nova, an AI service that helps you with your tasks"
+    : null;
+
+  if (savedAnswer) {
+    const answer = { reply: savedAnswer, needsClarification: false, tasks: [], activity: [] };
+    if (body.stream === true) {
+      return new Response("event: done\ndata: " + JSON.stringify(answer) + "\n\n", {
+        headers: {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache, no-transform",
+        },
+      });
+    }
+    return NextResponse.json(answer);
+  }
 
   if (body.stream === true) {
     return sseResponse(userRequest, history, body.fast === true);

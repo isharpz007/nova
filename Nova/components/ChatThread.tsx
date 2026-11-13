@@ -239,7 +239,7 @@ export function ChatThread({ conversationId }: ChatThreadProps) {
 
         await readSSE(res, (event, data) => {
           if (event === "plan") {
-            const p = data as { subtasks?: Subtask[] };
+            const p = data as { subtasks?: Subtask[]; warnings?: string[] };
             const subs = p.subtasks ?? [];
             setRun((r) => {
               if (!r) return r;
@@ -253,11 +253,13 @@ export function ChatThread({ conversationId }: ChatThreadProps) {
                   status: "pending",
                 };
               }
+              const acts = [...r.activity, activity(`Plan created — ${subs.length} subtask${subs.length === 1 ? "" : "s"}`, "progress")];
+              for (const w of p.warnings ?? []) acts.push(activity(w, "info"));
               return {
                 ...r,
                 tasks,
                 agents: { ...r.agents, lead: "in_progress" },
-                activity: [...r.activity, activity(`Plan created — ${subs.length} subtask${subs.length === 1 ? "" : "s"}`, "progress")],
+                activity: acts,
               };
             });
           } else if (event.startsWith("subtask_")) {
