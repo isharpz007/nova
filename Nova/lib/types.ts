@@ -40,3 +40,27 @@ export interface NotificationPreferences {
   push_updates: boolean;
   push_digest: boolean;
 }
+
+// ---------- Studio (Phase 0) ----------
+
+export interface ProjectDocument {
+  version: number;
+  layers: unknown[];
+  frames: unknown[];
+  [key: string]: unknown;
+}
+
+export interface Project {
+  id: string;
+  user_id: string;
+  title: string;
+  width: number;
+  height: number;
+  background: string;
+  fps: number;
+  document: ProjectDocument;
+  created_at: string;
+  updated_at: string;
+}
+
+export type ProjectSummary = Omit<Project, "document">;

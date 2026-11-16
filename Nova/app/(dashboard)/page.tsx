@@ -13,18 +13,19 @@ import {
 } from "recharts";
 import { getSupabaseBrowser } from "@/lib/supabase/client";
 import { isGuestClient } from "@/lib/guest";
-import type { Conversation, Notification, Profile } from "@/lib/types";
+import type { Conversation, Notification, Profile, ProjectSummary } from "@/lib/types";
 import { StatCard } from "@/components/StatCard";
 import { ActivityList } from "@/components/ActivityList";
 import { StatCardsSkeleton, CardSkeleton } from "@/components/Skeletons";
 import { EmptyState } from "@/components/EmptyState";
-import { IconChat, IconPlus, IconSend } from "@/components/Icons";
+import { IconChat, IconPlus, IconSend, IconTrash } from "@/components/Icons";
 
 interface DashboardData {
   profile: Profile | null;
   conversations: Conversation[];
   messageCount: number;
   notifications: Notification[];
+  projects: ProjectSummary[];
 }
 
 export default function HomePage() {
@@ -32,6 +33,12 @@ export default function HomePage() {
   const [error, setError] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [guest, setGuest] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const [newWidth, setNewWidth] = useState(1280);
+  const [newHeight, setNewHeight] = useState(720);
+  const [creating, setCreating] = useState(false);
+  const [projectError, setProjectError] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
     setGuest(isGuestClient());
@@ -42,7 +49,7 @@ export default function HomePage() {
     async function load() {
       try {
         if (isGuestClient()) {
-          setData({ profile: null, conversations: [], messageCount: 0, notifications: [] });
+          setData({ profile: null, conversations: [], messageCount: 0, notifications: [], projects: [] });
           return;
         }
         const supabase = getSupabaseBrowser();
@@ -51,7 +58,7 @@ export default function HomePage() {
         } = await supabase.auth.getUser();
         if (!user) return;
 
-        const [profileRes, convRes, msgRes, notifRes] = await Promise.all([
+        const [profileRes, convRes, msgRes, notifRes, projRes] = await Promise.all([
           supabase.from("profiles").select("*").eq("id", user.id).single<Profile>(),
           supabase
             .from("conversations")
@@ -66,6 +73,12 @@ export default function HomePage() {
             .eq("user_id", user.id)
             .order("created_at", { ascending: false })
             .limit(20),
+          supabase
+            .from("projects")
+            .select("id,user_id,title,width,height,background,fps,created_at,updated_at")
+            .eq("user_id", user.id)
+            .order("updated_at", { ascending: false })
+            .limit(12),
         ]);
 
         if (convRes.error) throw convRes.error;
@@ -75,6 +88,7 @@ export default function HomePage() {
             conversations: (convRes.data ?? []) as Conversation[],
             messageCount: msgRes.count ?? 0,
             notifications: (notifRes.data ?? []) as Notification[],
+            projects: (projRes.data ?? []) as ProjectSummary[],
           });
         }
       } catch (err) {
@@ -118,7 +132,7 @@ export default function HomePage() {
     );
   }
 
-  const { profile, conversations, messageCount, notifications } = data;
+  const { profile, conversations, messageCount, notifications, projects } = data;
   const firstName = profile?.full_name?.split(" ")[0] ?? "there";
   const unread = notifications.filter((n) => !n.read).length;
 
@@ -159,6 +173,70 @@ export default function HomePage() {
     window.location.href = `/chats/new?${params.toString()}`;
   }
 
+  async function createProject(e: React.FormEvent) {
+    e.preventDefault();
+    if (creating) return;
+    setCreating(true);
+    setProjectError(null);
+    try {
+      const res = await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: newTitle.trim() || "Untitled project",
+          width: newWidth,
+          height: newHeight,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Failed to create project");
+      window.location.href = `/studio/${json.project.id}`;
+    } catch (err) {
+      setProjectError(err instanceof Error ? err.message : "Failed to create project");
+      setCreating(false);
+    }
+  }
+
+  async function renameProject(p: ProjectSummary) {
+    const next = window.prompt("Rename project", p.title)?.trim();
+    if (!next || next === p.title) return;
+    setProjectError(null);
+    try {
+      const res = await fetch(`/api/projects/${p.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: next }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Rename failed");
+      setData((d) =>
+        d ? { ...d, projects: d.projects.map((q) => (q.id === p.id ? json.project : q)) } : d
+      );
+    } catch (err) {
+      setProjectError(err instanceof Error ? err.message : "Rename failed");
+    }
+  }
+
+  async function deleteProject(p: ProjectSummary) {
+    if (!window.confirm(`Delete "${p.title}"? This cannot be undone.`)) return;
+    setDeletingId(p.id);
+    setProjectError(null);
+    try {
+      const res = await fetch(`/api/projects/${p.id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const json = await res.json();
+        throw new Error(json.error ?? "Delete failed");
+      }
+      setData((d) =>
+        d ? { ...d, projects: d.projects.filter((q) => q.id !== p.id) } : d
+      );
+    } catch (err) {
+      setProjectError(err instanceof Error ? err.message : "Delete failed");
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
   return (
     <div className="space-y-8">
       <div>
@@ -195,6 +273,96 @@ export default function HomePage() {
           </button>
         </div>
       </form>
+
+      {/* Projects — drawing & animation studio */}
+      <section className="rounded-2xl bg-white dark:bg-[#303030] border border-slate-200 dark:border-white/10 shadow-sm p-5">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="font-semibold text-sm">Projects</h2>
+        </div>
+        {guest ? (
+          <EmptyState
+            title="Sign in to create projects"
+            message="Drawing and animation projects are saved to your account."
+          />
+        ) : (
+          <>
+            <form onSubmit={createProject} className="flex flex-wrap items-center gap-2 mb-4">
+              <input
+                value={newTitle}
+                onChange={(e) => setNewTitle(e.target.value)}
+                placeholder="Project name"
+                className="flex-1 min-w-36 rounded-lg border border-slate-200 dark:border-white/10 bg-transparent px-3 py-1.5 text-xs focus:border-teal-500 focus:outline-none"
+              />
+              <input
+                type="number"
+                min={8}
+                max={8192}
+                value={newWidth}
+                onChange={(e) => setNewWidth(parseInt(e.target.value) || 0)}
+                className="w-20 rounded-lg border border-slate-200 dark:border-white/10 bg-transparent px-3 py-1.5 text-xs focus:border-teal-500 focus:outline-none"
+                aria-label="Canvas width"
+              />
+              <span className="text-xs text-slate-400">×</span>
+              <input
+                type="number"
+                min={8}
+                max={8192}
+                value={newHeight}
+                onChange={(e) => setNewHeight(parseInt(e.target.value) || 0)}
+                className="w-20 rounded-lg border border-slate-200 dark:border-white/10 bg-transparent px-3 py-1.5 text-xs focus:border-teal-500 focus:outline-none"
+                aria-label="Canvas height"
+              />
+              <button
+                type="submit"
+                disabled={creating}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-teal-600 hover:bg-teal-700 disabled:opacity-40 text-white px-3 py-1.5 text-xs font-medium"
+              >
+                <IconPlus className="h-3.5 w-3.5" />
+                {creating ? "Creating…" : "New project"}
+              </button>
+            </form>
+            {projectError && (
+              <p className="text-xs text-red-500 mb-3" role="alert">
+                {projectError}
+              </p>
+            )}
+            {projects.length === 0 ? (
+              <p className="text-sm text-slate-500 dark:text-neutral-400 py-2">
+                No projects yet. Create one to start drawing.
+              </p>
+            ) : (
+              <ul className="divide-y divide-slate-100 dark:divide-white/10">
+                {projects.map((p) => (
+                  <li key={p.id} className="flex items-center gap-3 py-2.5 group">
+                    <Link href={`/studio/${p.id}`} className="min-w-0 flex-1">
+                      <p className="text-sm font-medium truncate group-hover:text-teal-600 dark:group-hover:text-teal-400">
+                        {p.title}
+                      </p>
+                      <p className="text-xs text-slate-400">
+                        {p.width} × {p.height} · {new Date(p.updated_at).toLocaleDateString()}
+                      </p>
+                    </Link>
+                    <button
+                      onClick={() => renameProject(p)}
+                      className="rounded-lg px-2 py-1 text-xs text-slate-500 dark:text-neutral-400 hover:bg-slate-100 dark:hover:bg-white/10"
+                    >
+                      Rename
+                    </button>
+                    <button
+                      onClick={() => deleteProject(p)}
+                      disabled={deletingId === p.id}
+                      className="rounded-lg p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 disabled:opacity-40"
+                      aria-label={`Delete ${p.title}`}
+                    >
+                      <IconTrash className="h-4 w-4" />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+      </section>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard label="Conversations" value={String(conversations.length)} hint="All time" />

@@ -145,3 +145,59 @@ create policy "avatars_update_own" on storage.objects
   for update using (
     bucket_id = 'avatars' and auth.uid()::text = (storage.foldername(name))[1]
   );
+
+-- ---------- projects (studio, Phase 0) ----------
+-- Additive only — safe to re-run; does not touch existing tables.
+
+create table if not exists public.projects (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users (id) on delete cascade,
+  title text not null default 'Untitled project',
+  width integer not null check (width between 8 and 8192),
+  height integer not null check (height between 8 and 8192),
+  background text not null default '#ffffff',
+  fps integer not null default 12 check (fps between 1 and 120),
+  document jsonb not null default '{"version":1,"layers":[],"frames":[]}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists projects_user_id_idx on public.projects (user_id);
+
+alter table public.projects enable row level security;
+
+create policy "projects_select_own" on public.projects
+  for select using (auth.uid() = user_id);
+create policy "projects_insert_own" on public.projects
+  for insert with check (auth.uid() = user_id);
+create policy "projects_update_own" on public.projects
+  for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "projects_delete_own" on public.projects
+  for delete using (auth.uid() = user_id);
+
+drop trigger if exists projects_touch on public.projects;
+create trigger projects_touch
+  before update on public.projects
+  for each row execute function public.touch_updated_at();
+
+-- ---------- storage: project-assets (private) ----------
+insert into storage.buckets (id, name, public)
+values ('project-assets', 'project-assets', false)
+on conflict (id) do nothing;
+
+create policy "project_assets_select_own" on storage.objects
+  for select using (
+    bucket_id = 'project-assets' and auth.uid()::text = (storage.foldername(name))[1]
+  );
+create policy "project_assets_insert_own" on storage.objects
+  for insert with check (
+    bucket_id = 'project-assets' and auth.uid()::text = (storage.foldername(name))[1]
+  );
+create policy "project_assets_update_own" on storage.objects
+  for update using (
+    bucket_id = 'project-assets' and auth.uid()::text = (storage.foldername(name))[1]
+  );
+create policy "project_assets_delete_own" on storage.objects
+  for delete using (
+    bucket_id = 'project-assets' and auth.uid()::text = (storage.foldername(name))[1]
+  );
